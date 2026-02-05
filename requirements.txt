@@ -1,0 +1,11 @@
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn
+xgboost
+pymongo
+python-dotenv
+requests
+joblib
+streamlit>=1.28.0
+altair<5
+plotly
