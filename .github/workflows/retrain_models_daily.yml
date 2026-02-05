@@ -1,0 +1,70 @@
+name: Retrain Models Daily
+
+on:
+  schedule:
+    # Run every day at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  retrain-models:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Fetch dataset from feature store
+        env:
+          MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
+          MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
+          MONGODB_CLUSTER: ${{ secrets.MONGODB_CLUSTER }}
+        run: |
+          python data_collection/prepare_training_data.py
+      
+      - name: Train XGBoost model
+        env:
+          MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
+          MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
+          MONGODB_CLUSTER: ${{ secrets.MONGODB_CLUSTER }}
+        run: |
+          python models/train_xgboost.py
+      
+      - name: Train Random Forest model
+        env:
+          MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
+          MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
+          MONGODB_CLUSTER: ${{ secrets.MONGODB_CLUSTER }}
+        run: |
+          python models/train_randomforest.py
+      
+      - name: Train SVM model
+        env:
+          MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
+          MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
+          MONGODB_CLUSTER: ${{ secrets.MONGODB_CLUSTER }}
+        run: |
+          python models/train_svm.py
+      
+      - name: Upload trained models
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: |
+            *.pkl
+            *.h5
+          retention-days: 30
+      
+      - name: Log completion
+        run: |
+          echo "Model retraining completed at $(date)"
