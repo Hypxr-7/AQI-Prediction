@@ -50,192 +50,111 @@ def get_mongodb_client():
     return client
 
 @st.cache_data(ttl=3600)
-def load_models_from_registry():
-    """Load the latest models from MongoDB model registry"""
+def load_best_model_from_registry():
+    """Load the model with highest accuracy from MongoDB model registry"""
     try:
         client = get_mongodb_client()
         db = client["aqi_prediction"]
         registry = db["model_registry"]
         
-        models = {}
-        model_types = ['xgboost', 'random_forest', 'svm']
+        # Get model with highest accuracy
+        doc = registry.find_one(
+            {'status': 'active'},
+            sort=[('accuracy', -1), ('training_date', -1)]
+        )
         
-        for model_type in model_types:
-            # Get latest model of this type
-            doc = registry.find_one(
-                {'model_type': model_type},
-                sort=[('registered_at', -1)]
-            )
-            
-            if doc:
-                # Deserialize model and scaler
-                model_bytes = BytesIO(doc['model_binary'])
-                scaler_bytes = BytesIO(doc['scaler_binary'])
-                
-                model = pickle.load(model_bytes)
-                scaler = joblib.load(scaler_bytes)
-                
-                models[model_type] = {
-                    'model': model,
-                    'scaler': scaler,
-                    'feature_cols': doc.get('feature_cols', []),
-                    'accuracy': doc.get('accuracy', doc.get('metrics', {}).get('accuracy', 0.0)),
-                    'registered_at': doc.get('registered_at'),
-                    'class_mapping': doc.get('additional_info', {}).get('class_mapping'),
-                    'reverse_mapping': doc.get('additional_info', {}).get('reverse_mapping')
-                }
-                
-        return models
-    except Exception as e:
-        st.error(f"Error loading models: {e}")
-        return {}
-
-@st.cache_data(ttl=1800)
-def fetch_forecast_data():
-    """Fetch weather forecast for next 3 days"""
-    try:
-        # Open-Meteo forecast API
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            'latitude': LAT,
-            'longitude': LON,
-            'hourly': 'temperature_2m,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_direction_10m,rain,direct_radiation',
-            'forecast_days': 3,
-            'timezone': 'Asia/Karachi'
+        if not doc:
+            return None
+        
+        # Deserialize model and scaler
+        model_bytes = BytesIO(doc['model_binary'])
+        scaler_bytes = BytesIO(doc['scaler_binary'])
+        
+        model = pickle.load(model_bytes)
+        scaler = pickle.load(scaler_bytes)
+        
+        model_info = {
+            'model': model,
+            'scaler': scaler,
+            'model_name': doc.get('model_name', 'Unknown'),
+            'model_type': doc.get('model_type', 'unknown'),
+            'feature_cols': doc.get('features', []),
+            'accuracy': doc.get('accuracy', 0.0),
+            'training_date': doc.get('training_date'),
+            'forecast_hours': doc.get('forecast_hours', 72),
+            'version': doc.get('version', 'N/A')
         }
         
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Convert to DataFrame
-        hourly = data['hourly']
-        df = pd.DataFrame({
-            'time': pd.to_datetime(hourly['time']),
-            'temp_c': hourly['temperature_2m'],
-            'humidity_pct': hourly['relative_humidity_2m'],
-            'pressure_hpa': hourly['pressure_msl'],
-            'wind_speed_kmh': hourly['wind_speed_10m'],
-            'wind_dir_deg': hourly['wind_direction_10m'],
-            'rain_mm': hourly['rain'],
-            'solar_rad_wm2': hourly['direct_radiation']
-        })
-        
-        return df
+        return model_info
     except Exception as e:
-        st.error(f"Error fetching forecast data: {e}")
+        st.error(f"Error loading model: {e}")
         return None
 
 @st.cache_data(ttl=1800)
-def fetch_current_pollution():
-    """Fetch current air pollution data"""
+def fetch_latest_data_from_mongodb():
+    """Fetch the latest 72 entries from MongoDB feature store"""
     try:
-        API_KEY = os.getenv("OPENWEATHER_API_KEY")
-        if not API_KEY:
-            st.warning("OpenWeather API key not found. Using default pollution values.")
-            return {
-                'pm2_5': 35.0,
-                'pm10': 50.0,
-                'co': 400.0,
-                'no2': 30.0,
-                'so2': 10.0,
-                'o3': 60.0
-            }
+        client = get_mongodb_client()
+        db = client["aqi_prediction"]
+        fs = db["feature_store"]
         
-        url = "http://api.openweathermap.org/data/2.5/air_pollution"
-        params = {'lat': LAT, 'lon': LON, 'appid': API_KEY}
+        # Get latest 72 records sorted by timestamp
+        cursor = fs.find({}, {"_id": 0}).sort("timestamp", -1).limit(72)
+        df = pd.DataFrame(list(cursor))
         
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        if df.empty:
+            st.error("No data found in feature store")
+            return None
         
-        components = data['list'][0]['components']
-        return {
-            'pm2_5': components['pm2_5'],
-            'pm10': components['pm10'],
-            'co': components['co'],
-            'no2': components['no2'],
-            'so2': components['so2'],
-            'o3': components['o3']
-        }
+        # Reverse to get chronological order (oldest to newest)
+        df = df.iloc[::-1].reset_index(drop=True)
+        
+        # Convert timestamp to datetime
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        return df
     except Exception as e:
-        st.warning(f"Error fetching pollution data: {e}. Using defaults.")
-        return {
-            'pm2_5': 35.0,
-            'pm10': 50.0,
-            'co': 400.0,
-            'no2': 30.0,
-            'so2': 10.0,
-            'o3': 60.0
-        }
+        st.error(f"Error fetching data from MongoDB: {e}")
+        return None
 
-def prepare_features(weather_df, pollution_data):
-    """Prepare features for prediction"""
-    # Add pollution data (assume constant for forecast)
-    for key, value in pollution_data.items():
-        weather_df[key] = value
-    
-    # Add temporal features
-    weather_df['hour'] = weather_df['time'].dt.hour
-    weather_df['month'] = weather_df['time'].dt.month
-    
-    # Feature order (must match training)
-    feature_cols = ['pm2_5', 'pm10', 'co', 'no2', 'so2', 'o3',
-                    'temp_c', 'humidity_pct', 'pressure_hpa', 
-                    'wind_speed_kmh', 'wind_dir_deg', 'rain_mm', 'solar_rad_wm2',
-                    'hour', 'month']
-    
-    return weather_df[feature_cols]
+def predict_aqi(model_info, features_df):
+    """Make predictions using the best model"""
+    try:
+        # Extract features in correct order
+        feature_cols = model_info['feature_cols']
+        X = features_df[feature_cols]
+        
+        # Scale features
+        X_scaled = model_info['scaler'].transform(X)
+        
+        # Make predictions
+        predictions = model_info['model'].predict(X_scaled)
+        
+        return predictions.astype(int)
+    except Exception as e:
+        st.error(f"Error making predictions: {e}")
+        return None
 
-def predict_aqi(models, features_df):
-    """Make predictions using all models"""
-    predictions = {}
-    
-    for model_name, model_data in models.items():
-        try:
-            # Scale features
-            features_scaled = model_data['scaler'].transform(features_df)
-            
-            # Make predictions
-            y_pred = model_data['model'].predict(features_scaled)
-            
-            # Map back to original classes if mapping exists
-            if model_name == 'xgboost' and model_data['reverse_mapping']:
-                reverse_map = {int(k): int(v) for k, v in model_data['reverse_mapping'].items()}
-                y_pred = np.array([reverse_map.get(pred, pred) for pred in y_pred])
-            
-            predictions[model_name] = y_pred
-        except Exception as e:
-            st.error(f"Error predicting with {model_name}: {e}")
-            predictions[model_name] = None
-    
-    return predictions
-
-def plot_predictions(weather_df, predictions):
-    """Plot AQI predictions for all models"""
+def plot_predictions(predictions_df, model_name):
+    """Plot AQI predictions"""
     fig = go.Figure()
     
-    # Color mapping for models
-    model_colors = {
-        'xgboost': '#1f77b4',
-        'randomforest': '#2ca02c',
-        'svm': '#ff7f0e'
-    }
-    
-    for model_name, preds in predictions.items():
-        if preds is not None:
-            fig.add_trace(go.Scatter(
-                x=weather_df['time'],
-                y=preds,
-                mode='lines+markers',
-                name=model_name.upper(),
-                line=dict(width=2, color=model_colors.get(model_name, '#000000')),
-                marker=dict(size=6),
-                hovertemplate='<b>%{fullData.name}</b><br>' +
-                              'Time: %{x}<br>' +
-                              'AQI Level: %{y}<br>' +
-                              '<extra></extra>'
-            ))
+    # Main prediction line
+    fig.add_trace(go.Scatter(
+        x=predictions_df['predicted_time'],
+        y=predictions_df['predicted_aqi'],
+        mode='lines+markers',
+        name=f'{model_name} Predictions',
+        line=dict(width=3, color='#1f77b4'),
+        marker=dict(size=6),
+        hovertemplate='<b>Predicted AQI</b><br>' +
+                      'Time: %{x}<br>' +
+                      'AQI Level: %{y}<br>' +
+                      'Category: %{customdata}<br>' +
+                      '<extra></extra>',
+        customdata=predictions_df['predicted_label']
+    ))
     
     # Add AQI level background colors
     fig.add_hrect(y0=0.5, y1=1.5, fillcolor=AQI_LABELS[1]['color'], opacity=0.1, line_width=0)
@@ -245,35 +164,29 @@ def plot_predictions(weather_df, predictions):
     fig.add_hrect(y0=4.5, y1=5.5, fillcolor=AQI_LABELS[5]['color'], opacity=0.1, line_width=0)
     
     fig.update_layout(
-        title='AQI Predictions - Next 72 Hours',
-        xaxis_title='Time',
+        title=f'AQI Predictions - Next 72 Hours (Using {model_name})',
+        xaxis_title='Predicted Time',
         yaxis_title='AQI Level',
         yaxis=dict(
             tickmode='array',
             tickvals=[1, 2, 3, 4, 5],
-            ticktext=['Good', 'Fair', 'Moderate', 'Poor', 'Very Poor']
+            ticktext=['Good', 'Fair', 'Moderate', 'Poor', 'Very Poor'],
+            range=[0.5, 5.5]
         ),
         hovermode='x unified',
-        height=500,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
+        height=500
     )
     
     return fig
 
-def plot_weather_conditions(weather_df):
-    """Plot weather conditions"""
+def plot_input_conditions(input_df):
+    """Plot input environmental conditions used for predictions"""
     fig = go.Figure()
     
     # Temperature
     fig.add_trace(go.Scatter(
-        x=weather_df['time'],
-        y=weather_df['temp_c'],
+        x=input_df['timestamp'],
+        y=input_df['temp_c'],
         mode='lines',
         name='Temperature (°C)',
         yaxis='y',
@@ -282,8 +195,8 @@ def plot_weather_conditions(weather_df):
     
     # Humidity
     fig.add_trace(go.Scatter(
-        x=weather_df['time'],
-        y=weather_df['humidity_pct'],
+        x=input_df['timestamp'],
+        y=input_df['humidity_pct'],
         mode='lines',
         name='Humidity (%)',
         yaxis='y2',
@@ -291,7 +204,7 @@ def plot_weather_conditions(weather_df):
     ))
     
     fig.update_layout(
-        title='Weather Conditions - Next 72 Hours',
+        title='Input Environmental Conditions (Latest 72 Hours)',
         xaxis_title='Time',
         yaxis=dict(
             title=dict(text='Temperature (°C)', font=dict(color='#ff6b6b')),
@@ -319,16 +232,15 @@ def plot_weather_conditions(weather_df):
 # Main App
 def main():
     st.title("🌫️ AQI Predictor - Karachi, Pakistan")
-    st.markdown("Real-time Air Quality Index predictions for the next 3 days")
+    st.markdown("72-hour Air Quality Index predictions using historical data and ML models")
     
     # Sidebar
     with st.sidebar:
         st.header("ℹ️ About")
         st.markdown("""
-        This application predicts Air Quality Index (AQI) for Karachi using:
-        - **XGBoost Classifier**
-        - **Random Forest Classifier**
-        - **Support Vector Machine (SVM)**
+        This application predicts Air Quality Index (AQI) for the next 72 hours using:
+        - **Best performing ML model** from model registry
+        - **Historical data** from MongoDB feature store
         
         ### AQI Categories
         - 🟢 **Good (1)**: Air quality is satisfactory
@@ -337,9 +249,11 @@ def main():
         - 🔴 **Poor (4)**: Health effects for everyone
         - 🟣 **Very Poor (5)**: Health alert, everyone may experience serious effects
         
-        ### Data Sources
-        - Weather: Open-Meteo API
-        - Pollution: OpenWeatherMap API
+        ### How It Works
+        The model uses the latest 72 hours of environmental data to predict AQI levels 72 hours into the future.
+        
+        ### Data Source
+        - Historical Data: MongoDB Feature Store
         - Models: MongoDB Model Registry
         """)
         
@@ -347,57 +261,92 @@ def main():
             st.cache_data.clear()
             st.rerun()
     
-    # Load models
-    with st.spinner("Loading models from registry..."):
-        models = load_models_from_registry()
+    # Load best model
+    with st.spinner("Loading best model from registry..."):
+        model_info = load_best_model_from_registry()
     
-    if not models:
-        st.error("❌ Failed to load models from registry. Please check MongoDB connection.")
+    if not model_info:
+        st.error("❌ Failed to load model from registry. Please check MongoDB connection.")
         return
     
     # Display model info
-    st.success(f"✅ Successfully loaded {len(models)} models")
+    st.success(f"✅ Successfully loaded best model: {model_info['model_name']}")
     
-    cols = st.columns(len(models))
-    for idx, (model_name, model_data) in enumerate(models.items()):
-        with cols[idx]:
-            st.metric(
-                label=f"{model_name.upper()}",
-                value=f"{model_data['accuracy']:.2%}",
-                delta="Accuracy"
-            )
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Model Type", model_info['model_type'].upper())
+    with col2:
+        st.metric("Accuracy", f"{model_info['accuracy']:.2%}")
+    with col3:
+        st.metric("Forecast Horizon", f"{model_info['forecast_hours']} hrs")
+    with col4:
+        st.metric("Version", model_info['version'][:8])
     
     st.divider()
     
+    # Fetch latest data from MongoDB
+    with st.spinner("Fetching latest data from MongoDB..."):
+        data_df = fetch_latest_data_from_mongodb()
+    
+    if data_df is None or data_df.empty:
+        st.error("❌ Failed to fetch data from MongoDB feature store.")
+        return
+    
+    st.info(f"📊 Using latest {len(data_df)} data points from feature store")
+    
+    # Make predictions
+    with st.spinner("Generating 72-hour predictions..."):
+        predictions = predict_aqi(model_info, data_df)
+    
+    if predictions is None:
+        st.error("❌ Failed to generate predictions.")
+        return
+    
+    # Create predictions dataframe with future timestamps
+    # Predictions are for 72 hours ahead from the last timestamp
+    last_timestamp = data_df['timestamp'].iloc[-1]
+    predicted_times = [last_timestamp + timedelta(hours=i) for i in range(1, 73)]
+    
+    predictions_df = pd.DataFrame({
+        'predicted_time': predicted_times,
+        'predicted_aqi': predictions,
+        'predicted_label': [AQI_LABELS.get(int(p), {}).get('name', 'Unknown') for p in predictions]
+    })
+    
     # Plot predictions
-    st.subheader("🔮 AQI Predictions")
-    fig_aqi = plot_predictions(weather_df, predictions)
+    st.subheader("🔮 AQI Predictions (Next 72 Hours)")
+    fig_aqi = plot_predictions(predictions_df, model_info['model_name'])
     st.plotly_chart(fig_aqi, use_container_width=True)
     
-    # Plot weather conditions
-    st.subheader("🌤️ Weather Forecast")
-    fig_weather = plot_weather_conditions(weather_df)
-    st.plotly_chart(fig_weather, use_container_width=True)
+    # Plot input conditions
+    st.subheader("📈 Input Environmental Conditions")
+    fig_input = plot_input_conditions(data_df)
+    st.plotly_chart(fig_input, use_container_width=True)
     
     # Predictions table
     st.subheader("📋 Detailed Predictions")
     
-    # Create comparison dataframe
-    results_df = weather_df[['time']].copy()
-    for model_name, preds in predictions.items():
-        if preds is not None:
-            results_df[f'{model_name}_aqi'] = preds
-            results_df[f'{model_name}_label'] = [AQI_LABELS.get(int(p), {}).get('name', 'Unknown') for p in preds]
-    
-    # Show next 24 hours
+    # Show first 24 hours
     st.dataframe(
-        results_df.head(24),
+        predictions_df.head(24),
         use_container_width=True,
         hide_index=True
     )
     
+    # Summary statistics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        avg_aqi = predictions.mean()
+        st.metric("Average Predicted AQI", f"{avg_aqi:.2f}")
+    with col2:
+        most_common = pd.Series(predictions).mode()[0]
+        st.metric("Most Common Category", AQI_LABELS.get(most_common, {}).get('name', 'Unknown'))
+    with col3:
+        worst_aqi = predictions.max()
+        st.metric("Worst Predicted Level", AQI_LABELS.get(worst_aqi, {}).get('name', 'Unknown'))
+    
     # Download button
-    csv = results_df.to_csv(index=False)
+    csv = predictions_df.to_csv(index=False)
     st.download_button(
         label="📥 Download Full Predictions (CSV)",
         data=csv,
@@ -409,7 +358,7 @@ def main():
     st.divider()
     st.markdown("""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-    Data updated every 1 hour | Models retrained daily
+    Predictions based on latest feature store data | Model automatically selected by highest accuracy
     </div>
     """, unsafe_allow_html=True)
 
