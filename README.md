@@ -145,6 +145,13 @@ AQI-Predictor/
    MONGODB_PASSWORD=your_mongodb_password
    MONGODB_CLUSTER=your_cluster.mongodb.net
    ```
+4. Set up GitHub Actions secrets in your repository settings with the credentials from your `.env` file.
+
+### Live Dashboard
+
+The application is deployed and accessible here:  
+https://aqi-prediction-y2pubhjmdctw4t3tiyenpj.streamlit.app/
+
 
 ### Running Locally
 
